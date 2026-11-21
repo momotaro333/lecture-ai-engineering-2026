@@ -139,7 +139,7 @@ def search(query: str) -> list[dict]:
 
 
 def search_graph(query: str) -> dict:
-    """ベクトル検索を入口に、前後ページと共通用語で候補を広げる。"""
+    """ベクトル検索を入口に、関連用語をたどり、質問語に近いページを優先する。"""
     pages = {page["page_id"]: page for page in load_pages(RAG_SOURCE)}
     graph = json.loads(RAG_GRAPH.read_text(encoding="utf-8"))
     nodes = {node["id"]: node for node in graph["nodes"]
@@ -147,12 +147,24 @@ def search_graph(query: str) -> dict:
     adjacent = defaultdict(set)
     for edge in graph["edges"]:
         a, b = edge["source"], edge["target"]
-        if edge["relation"] in ("next_page", "mentions") and a in nodes and b in nodes:
+        if edge["relation"] in ("next_page", "mentions", "related_term") and a in nodes and b in nodes:
             adjacent[a].add(b)
             adjacent[b].add(a)
 
     seeds = [hit for hit in search(query) if hit["page_id"] in pages][:min(GRAPH_START_K, GRAPH_MAX_RESULTS)]
     seed_ids = {seed["page_id"] for seed in seeds}
+    normalized_query = re.sub(r"\s+", "", query.casefold())
+    query_terms = [
+        re.sub(r"\s+", "", node["title"].casefold())
+        for node in nodes.values()
+        if node["kind"] == "term"
+        and re.sub(r"\s+", "", node["title"].casefold()) in normalized_query
+    ]
+
+    def lexical_score(page: dict) -> int:
+        text = re.sub(r"\s+", "", f"{page['title']}{page['content']}".casefold())
+        return sum(term in text for term in query_terms)
+
     results, candidates = [], {}
     for rank, seed in enumerate(seeds):
         root = seed["page_id"]
@@ -175,9 +187,9 @@ def search_graph(query: str) -> dict:
                 if neighbor not in pages or neighbor in seed_ids:
                     continue
                 frequency = max((len(adjacent[n]) for n in route if nodes[n]["kind"] == "term"), default=0)
-                priority = (len(route) - 1, frequency, rank, neighbor)
                 candidate = {**pages[neighbor], "hops": len(route) - 1,
                              "path": [{"id": n, "title": nodes[n]["title"]} for n in route]}
+                priority = (-lexical_score(candidate), len(route) - 1, frequency, rank, neighbor)
                 if neighbor not in candidates or priority < candidates[neighbor][0]:
                     candidates[neighbor] = (priority, candidate)
     expanded = [candidate for _, candidate in sorted(candidates.values())]
